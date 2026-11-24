@@ -30,7 +30,7 @@ object Store {
     fun imageFile(c: Context, id: String) = File(c.filesDir, "t_$id.png")
 
     fun scanInterval(c: Context): Int = p(c).getInt("scan", 500)
-    fun setScanInterval(c: Context, ms: Int) = p(c).edit().putInt("scan", ms.coerceAtLeast(350)).apply()
+    fun setScanInterval(c: Context, ms: Int) = p(c).edit().putInt("scan", ms.coerceAtLeast(1)).apply()
 
     fun load(c: Context): MutableList<Target> {
         val out = mutableListOf<Target>()
