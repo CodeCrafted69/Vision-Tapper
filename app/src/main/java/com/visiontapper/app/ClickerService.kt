@@ -48,7 +48,7 @@ class ClickerService : AccessibilityService() {
         var instance: ClickerService? = null
     }
 
-    private class NumItem(val num: Int, val x: Float, val y: Float)
+    private class NumItem(val num: Int, val x: Float, val y: Float, val box: Rect)
 
     private lateinit var wm: WindowManager
     private var panel: LinearLayout? = null
@@ -116,6 +116,21 @@ class ClickerService : AccessibilityService() {
         status?.text = s
     }
 
+    private fun chip(name: String, get: () -> Boolean, set: (Boolean) -> Unit): TextView {
+        val v = tv("", 12f)
+        fun paint() {
+            val on = get()
+            v.text = "$name: ${if (on) "ON" else "OFF"}"
+            v.background = GradientDrawable().apply {
+                setColor(if (on) 0xFF00897B.toInt() else 0xFF424242.toInt())
+                cornerRadius = dp(12).toFloat()
+            }
+        }
+        v.setOnClickListener { set(!get()); paint() }
+        paint()
+        return v
+    }
+
     fun showPanel() {
         if (panel != null) {
             panel?.visibility = View.VISIBLE
@@ -142,12 +157,23 @@ class ClickerService : AccessibilityService() {
         startBtn = start
         row.addView(handle); row.addView(start); row.addView(add); row.addView(app)
 
+        // Toggles: Loop (tap ALL of each number, then move on) and Color (colour targets on/off)
+        val row2 = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(0, dp(2), 0, dp(2))
+        }
+        val lp2 = { LinearLayout.LayoutParams(-2, -2).apply { setMargins(dp(4), 0, dp(4), 0) } }
+        row2.addView(chip("Loop", { Store.loopAll(this) }, { Store.setLoopAll(this, it) }), lp2())
+        row2.addView(chip("Color", { Store.colorOn(this) }, { Store.setColorOn(this, it) }), lp2())
+
         val m = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             visibility = View.GONE
             addView(tv("Tap an image") { beginCapture(TargetType.IMAGE) })
             addView(tv("Numbered images 1→n") { beginCapture(TargetType.NUM_IMAGES) })
             addView(tv("Numbers in an area 1→n") { beginCapture(TargetType.NUM_AREA) })
+            addView(tv("Pick a color") { beginColorPick() })
         }
         menu = m
         val st = TextView(this).apply {
@@ -158,9 +184,9 @@ class ClickerService : AccessibilityService() {
         }
         status = st
 
-        root.addView(row); root.addView(m); root.addView(st)
+        root.addView(row); root.addView(row2); root.addView(m); root.addView(st)
         collapsible.clear()
-        collapsible.addAll(listOf(start, add, app, m, st))
+        collapsible.addAll(listOf(start, add, app, row2, m, st))
 
         val lp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.WRAP_CONTENT,
@@ -231,7 +257,14 @@ class ClickerService : AccessibilityService() {
     private suspend fun loop() {
         while (scope.isActive) {
             try {
-                val targets = Store.load(this).filter { it.enabled }
+                val all = Store.load(this).filter { it.enabled }
+                val colorOn = Store.colorOn(this)
+                val colors = if (colorOn) all.filter { it.type == TargetType.COLOR } else emptyList()
+                val others = all.filter { it.type != TargetType.COLOR }
+                // Colour targets act as a background filter when other targets are running with them.
+                val combined = colors.isNotEmpty() && others.any { it.useColor }
+                val targets = if (colorOn) all else others
+
                 val shot = screenshot()
                 if (shot == null) {
                     if (lastShotError == ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT) {
@@ -242,7 +275,7 @@ class ClickerService : AccessibilityService() {
                     delay(700)
                     continue
                 }
-                for (t in targets) processTarget(t, shot)
+                for (t in targets) processTarget(t, shot, colors, combined)
                 shot.recycle()
                 delay(Store.scanInterval(this).toLong())
             } catch (e: CancellationException) {
@@ -254,43 +287,81 @@ class ClickerService : AccessibilityService() {
         }
     }
 
-    private suspend fun processTarget(t: Target, shot: Bitmap) {
+    private fun padded(b: Rect): Rect {
+        val dx = (b.width() * 0.25f).toInt()
+        val dy = (b.height() * 0.25f).toInt()
+        return Rect(b.left - dx, b.top - dy, b.right + dx, b.bottom + dy)
+    }
+
+    /** True if no colour filter applies to [t], or [box] is (mostly) one of the picked colours. */
+    private fun colorOk(t: Target, shot: Bitmap, box: Rect, colors: List<Target>, combined: Boolean): Boolean {
+        if (!combined || !t.useColor) return true
+        return colors.any { ColorMatch.coverage(shot, box, it.color, it.colorTol) >= it.minCoverage / 100f }
+    }
+
+    private suspend fun processTarget(t: Target, shot: Bitmap, colors: List<Target>, combined: Boolean) {
         when (t.type) {
             TargetType.IMAGE -> {
                 val tpl = loadTpl(t) ?: return
                 val now = SystemClock.elapsedRealtime()
                 if (now - (lastTap[t.id] ?: 0L) < t.cooldownMs) return
+                val want = if (t.tapAll || combined) 20 else 1
                 val hits = withContext(Dispatchers.Default) {
-                    Matcher.find(shot, tpl, t.threshold / 100f, if (t.tapAll) 20 else 1)
-                }
-                for (h in hits) {
+                    Matcher.find(shot, tpl, t.threshold / 100f, want)
+                }.filter { colorOk(t, shot, Rect(it.x, it.y, it.x + it.w, it.y + it.h), colors, combined) }
+                val use = if (t.tapAll) hits else hits.take(1)
+                for (h in use) {
                     tap(h.cx, h.cy)
                     setStatus("Tapped “${t.name}” (${(h.score * 100).toInt()}%)")
                     delay(t.tapDelayMs.toLong())
                 }
-                if (hits.isNotEmpty()) lastTap[t.id] = now
+                if (use.isNotEmpty()) lastTap[t.id] = now
+            }
+
+            TargetType.COLOR -> {
+                if (combined) return // acting as a filter for the other targets
+                val now = SystemClock.elapsedRealtime()
+                if (now - (lastTap[t.id] ?: 0L) < t.cooldownMs) return
+                val blobs = withContext(Dispatchers.Default) {
+                    ColorMatch.blobs(shot, t.color, t.colorTol, t.minSize)
+                }
+                val use = if (t.tapAll) blobs.take(20) else blobs.take(1)
+                for (b in use) {
+                    tap(b.cx, b.cy)
+                    setStatus("Tapped color “${t.name}”")
+                    delay(t.tapDelayMs.toLong())
+                }
+                if (use.isNotEmpty()) lastTap[t.id] = now
             }
 
             TargetType.NUM_IMAGES, TargetType.NUM_AREA -> {
+                val loopAll = Store.loopAll(this)
+                val wrap = t.loop || loopAll
                 var next = nextNums.getOrPut(t.id) { t.startNum }
                 if (t.maxNum > 0 && next > t.maxNum) {
-                    if (t.loop) next = t.startNum else { setStatus("“${t.name}” finished"); return }
+                    if (wrap) next = t.startNum else { setStatus("“${t.name}” finished"); return }
                 }
-                val items = readNumbers(t, shot)
+                val items = readNumbers(t, shot).filter { colorOk(t, shot, it.box, colors, combined) }
+                // Loop mode: once every visible number is behind us, start over at the first number.
+                if (loopAll && items.isNotEmpty() && items.none { it.num >= next }) next = t.startNum
+
                 var guard = 0
                 while (guard++ < 300) {
-                    val hit = items.firstOrNull { it.num == next } ?: break
-                    tap(hit.x, hit.y)
-                    setStatus("Tapped $next (“${t.name}”)")
+                    val same = items.filter { it.num == next }
+                    if (same.isEmpty()) break
+                    // Loop mode taps EVERY copy of this number before moving to the next one.
+                    val batch = if (loopAll) same else same.take(1)
+                    for (item in batch) {
+                        tap(item.x, item.y)
+                        delay(t.tapDelayMs.toLong())
+                    }
+                    setStatus("Tapped $next ×${batch.size} (“${t.name}”)")
                     next++
                     if (t.maxNum > 0 && next > t.maxNum) {
-                        if (t.loop) next = t.startNum
-                        nextNums[t.id] = next
+                        if (wrap) next = t.startNum
                         break
                     }
-                    nextNums[t.id] = next
-                    delay(t.tapDelayMs.toLong())
-                    if (!t.chain) break
+                    if (!(t.chain || loopAll)) break
                 }
                 nextNums[t.id] = next
             }
@@ -311,7 +382,8 @@ class ClickerService : AccessibilityService() {
                 val s = el.text.trim()
                 val box = el.boundingBox ?: continue
                 if (s.length in 1..4 && s.all { it.isDigit() }) {
-                    out.add(NumItem(s.toInt(), l + box.exactCenterX(), tp + box.exactCenterY()))
+                    val sb = padded(Rect(l + box.left, tp + box.top, l + box.right, tp + box.bottom))
+                    out.add(NumItem(s.toInt(), l + box.exactCenterX(), tp + box.exactCenterY(), sb))
                 }
             }
         } else {
@@ -329,7 +401,7 @@ class ClickerService : AccessibilityService() {
                 if (hh < 80) crop = Bitmap.createScaledBitmap(crop, w * 3, hh * 3, true)
                 val txt = ocr(crop)?.text ?: continue
                 val m = digits.find(txt.replace(Regex("\\s"), "")) ?: continue
-                out.add(NumItem(m.value.toInt(), h.cx, h.cy))
+                out.add(NumItem(m.value.toInt(), h.cx, h.cy, Rect(l, tp, l + w, tp + hh)))
             }
         }
         return out
@@ -383,9 +455,9 @@ class ClickerService : AccessibilityService() {
             .addOnFailureListener { c.resume(null) }
     }
 
-    // ───────────────────────── capture / crop flow ─────────────────────────
+    // ───────────────────────── capture / crop / colour-pick flows ─────────────────────────
 
-    private fun beginCapture(kind: TargetType) {
+    private fun freezeScreen(then: (Bitmap) -> Unit) {
         if (running) stopEngine()
         menu?.visibility = View.GONE
         panel?.visibility = View.INVISIBLE
@@ -393,24 +465,43 @@ class ClickerService : AccessibilityService() {
             delay(400)
             val shot = screenshot()
             panel?.visibility = View.VISIBLE
-            if (shot == null) {
-                toast("Couldn't capture the screen")
-                return@launch
-            }
-            showCropper(shot, kind)
+            if (shot == null) toast("Couldn't capture the screen") else then(shot)
         }
     }
 
-    private fun showCropper(shot: Bitmap, kind: TargetType) {
-        val frame = FrameLayout(this)
+    private fun beginCapture(kind: TargetType) = freezeScreen { shot ->
         val cv = CropView(this, shot)
-        frame.addView(cv, FrameLayout.LayoutParams(-1, -1))
-
         val hint = when (kind) {
             TargetType.IMAGE -> "Drag a box around the image to tap"
             TargetType.NUM_IMAGES -> "Drag a box around ONE numbered tile/button"
             TargetType.NUM_AREA -> "Drag a box around the area with the numbers"
+            TargetType.COLOR -> ""
         }
+        showOverlay(cv, hint) {
+            val r = cv.selection()
+            if (r == null) {
+                toast("Drag a bigger box first"); false
+            } else {
+                saveCapture(shot, r, kind); true
+            }
+        }
+    }
+
+    private fun beginColorPick() = freezeScreen { shot ->
+        val pv = ColorPickView(this, shot)
+        showOverlay(pv, "Tap the color you want to detect") {
+            val c = pv.picked
+            if (c == null) {
+                toast("Tap a color first"); false
+            } else {
+                saveColor(c); true
+            }
+        }
+    }
+
+    private fun showOverlay(content: View, hint: String, onSave: () -> Boolean) {
+        val frame = FrameLayout(this)
+        frame.addView(content, FrameLayout.LayoutParams(-1, -1))
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
@@ -423,15 +514,7 @@ class ClickerService : AccessibilityService() {
             runCatching { wm.removeView(frame) }
             cropFrame = null
         }
-        btns.addView(tv("✓ Save", 16f) {
-            val r = cv.selection()
-            if (r == null) {
-                toast("Drag a bigger box first")
-            } else {
-                saveCapture(shot, r, kind)
-                close()
-            }
-        })
+        btns.addView(tv("✓ Save", 16f) { if (onSave()) close() })
         btns.addView(tv("✕ Cancel", 16f) { close() })
         bar.addView(btns)
         frame.addView(bar, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply {
@@ -453,6 +536,15 @@ class ClickerService : AccessibilityService() {
         cropFrame = frame
     }
 
+    private fun saveColor(color: Int) {
+        val list = Store.load(this)
+        val id = UUID.randomUUID().toString().take(8)
+        val n = list.count { it.type == TargetType.COLOR } + 1
+        list.add(Target(id = id, name = "Color $n", type = TargetType.COLOR, color = color or (0xFF shl 24)))
+        Store.save(this, list)
+        toast("Saved “Color $n” – tune it in the ⚙ app")
+    }
+
     private fun saveCapture(shot: Bitmap, r: Rect, kind: TargetType) {
         val list = Store.load(this)
         val id = UUID.randomUUID().toString().take(8)
@@ -461,6 +553,7 @@ class ClickerService : AccessibilityService() {
             TargetType.IMAGE -> "Image"
             TargetType.NUM_IMAGES -> "Numbered images"
             TargetType.NUM_AREA -> "Number area"
+            TargetType.COLOR -> "Color"
         }
         var region: IntArray? = null
         var hasImage = false
