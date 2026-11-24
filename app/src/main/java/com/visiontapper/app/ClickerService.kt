@@ -65,6 +65,8 @@ class ClickerService : AccessibilityService() {
     private val tplCache = HashMap<String, Pair<Long, Bitmap>>()
     private val recognizer by lazy { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
 
+    @Volatile private var lastShotError = 0
+
     private val running: Boolean get() = job?.isActive == true
 
     // ───────────────────────── lifecycle ─────────────────────────
@@ -232,6 +234,10 @@ class ClickerService : AccessibilityService() {
                 val targets = Store.load(this).filter { it.enabled }
                 val shot = screenshot()
                 if (shot == null) {
+                    if (lastShotError == ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT) {
+                        delay(15) // Android allows ~3 screenshots/sec; retry as soon as it does
+                        continue
+                    }
                     setStatus("Screenshot failed (secure screen?)")
                     delay(700)
                     continue
@@ -348,10 +354,12 @@ class ClickerService : AccessibilityService() {
                 val bmp = Bitmap.wrapHardwareBuffer(hb, result.colorSpace)
                     ?.copy(Bitmap.Config.ARGB_8888, false)
                 hb.close()
+                lastShotError = 0
                 c.resume(bmp)
             }
 
             override fun onFailure(errorCode: Int) {
+                lastShotError = errorCode
                 c.resume(null)
             }
         })
