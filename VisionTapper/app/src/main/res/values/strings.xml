@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Vision Tapper</string>
+    <string name="a11y_desc">Draws a floating control panel over other apps, looks at the screen for images or numbers you chose, and performs taps on them.</string>
+</resources>
