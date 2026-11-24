@@ -83,7 +83,7 @@ class MainActivity : Activity() {
         if (on) root.addView(btn("Show floating panel") { ClickerService.instance?.showPanel() })
 
         // scan interval
-        root.addView(tv("Scan interval (ms, min 350)", 13f))
+        root.addView(tv("Scan interval (ms, min 1)", 13f))
         val scan = EditText(this).apply {
             inputType = InputType.TYPE_CLASS_NUMBER
             setText(Store.scanInterval(this@MainActivity).toString())
